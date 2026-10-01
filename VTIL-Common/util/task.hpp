@@ -3,6 +3,7 @@
 #include <future>
 #include <optional>
 #include <memory>
+#include <utility> // std::exchange
 #include "type_helpers.hpp"
 
 // [Configuration]

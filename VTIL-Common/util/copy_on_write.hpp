@@ -30,6 +30,7 @@
 #include <functional>
 #include <type_traits>
 #include <atomic>
+#include <utility> // std::exchange (not transitively included by modern libstdc++)
 #include "../io/asserts.hpp"
 #include "object_pool.hpp"
 #include "../util/intrinsics.hpp"
