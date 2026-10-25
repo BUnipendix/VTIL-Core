@@ -182,6 +182,29 @@ namespace vtil::symbolic
 	{
 		access_details result = {};
 
+		// Local patch: adversarial IR can hand an end iterator (block set,
+		// entry null) down from is_alive/written_by; the branches below
+		// dereference it->... and crash. No instruction means no access.
+		//
+		if ( it.is_end() )
+			return result;
+
+		// Local patch: written_by/read_by <-> tracer::trace form a mutual
+		// recursion that walks the block chain backward without a bound;
+		// adversarial dual-shell graphs (a certain anime game 4.3-4.7) make it spin for
+		// hours instead of resolving. Cap the nesting depth and report an
+		// unknown access beyond it so the tracer unwinds with an unknown
+		// expression instead of hanging.
+		//
+		static thread_local int64_t recursion_depth = 0;
+		struct depth_guard_t
+		{
+			int64_t& d;
+			~depth_guard_t() { d--; }
+		} _depth_guard{ ++recursion_depth };
+		if ( recursion_depth > 1000 )
+			return { .bit_offset = 0, .bit_count = 1, .read = false, .write = false, .unknown = true };
+
 		// If variable is of register type:
 		//
 		if ( auto reg = std::get_if<variable::register_t>( &var.descriptor ) )

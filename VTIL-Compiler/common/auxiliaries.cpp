@@ -414,7 +414,21 @@ namespace vtil::optimizer::aux
 							flags = orig_flags;
 
 							if ( exp_ptr != var.mem().base )
-								exp = trace( symbolic::variable{ std::next( var.at ), { exp_ptr, var.mem().bit_count } } );
+							{
+								// Local patch: adversarial IR can carry memory
+								// variables whose defining iterator is already
+								// at end (block set, entry null); std::next on
+								// such an iterator dereferences the null entry
+								// inside operator++ (upstream crash). Skip the
+								// re-trace and keep the partially transformed
+								// expression in that case.
+								//
+								auto next_it = var.at.is_end()
+									? var.at
+									: std::next( var.at );
+								if ( !next_it.is_end() )
+									exp = trace( symbolic::variable{ next_it, { exp_ptr, var.mem().bit_count } } );
+							}
 						}
 					};
 

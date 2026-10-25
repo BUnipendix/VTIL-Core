@@ -34,6 +34,22 @@ namespace vtil
 	//
 	vm_exit_reason vm_interface::execute( const instruction& ins )
 	{
+		// Local patch: nested instructions resolve their operands through
+		// deferred_result, which re-enters ::execute on a fresh VM instance
+		// per level. Adversarial dual-shell graphs (a certain anime game 4.3-4.7) nest
+		// this unboundedly and the whole pipeline spins for hours. Cap the
+		// nesting depth; unwinding via exception matches how the wall-clock
+		// budget above the lifter reports "fail fast".
+		//
+		static thread_local int64_t recursion_depth = 0;
+		struct depth_guard_t
+		{
+			int64_t& d;
+			~depth_guard_t() { d--; }
+		} _depth_guard{ ++recursion_depth };
+		if ( recursion_depth > 128 )
+			throw std::runtime_error( "vm-interface nesting depth exceeded" );
+
 		// Declare a helper to convert operands of current instruction into expressions.
 		//
 		auto cvt_operand = [ & ] ( int i ) -> symbolic::expression::reference

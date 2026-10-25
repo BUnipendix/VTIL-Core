@@ -26,6 +26,11 @@
 // POSSIBILITY OF SUCH DAMAGE.        
 //
 #include "tracer.hpp"
+#include <chrono>
+#include <cstdlib>
+// Local patch: scoped sub-deadline for bounded symbolic refinements.
+#include "../../VTIL-Common/util/rtrace-budget.hpp"
+#include <stdexcept>
 #include <vtil/io>
 #include "../vm/lambda.hpp"
 #include <vtil/utility>
@@ -284,6 +289,54 @@ namespace vtil
 	{
 		using namespace logger;
 
+		// Local patch: rtrace_primitive recurses through basic_block::enum_paths
+		// to enumerate backward paths; adversarial dual-shell graphs
+		// (a certain anime game 4.3-4.7) fork exponentially so a single user-level trace
+		// call can spin for hours with no budget check inside. Poll the wall
+		// clock every 1024 invocations and fail fast with the same
+		// "time budget exceeded" the lifter-side budget throws.
+		//
+		{
+			static thread_local uint64_t invoke_count = 0;
+			static thread_local std::chrono::steady_clock::time_point deadline{};
+			static thread_local bool deadline_set = false;
+			if ( ++invoke_count % 1024 == 0 )
+			{
+				if ( !deadline_set )
+				{
+					int64_t lim = 0;
+					if ( const char* e = getenv( "NOVMP_TIME_LIMIT" ) )
+						lim = atoll( e );
+					deadline_set = true;
+					deadline = lim > 0
+						? std::chrono::steady_clock::now() + std::chrono::seconds( lim )
+						: std::chrono::steady_clock::time_point::max();
+				}
+				if ( std::chrono::steady_clock::now() > deadline )
+					throw std::runtime_error( "time budget exceeded (rtrace)" );
+				// Local patch: honor the scoped refinement sub-deadline too.
+				if ( vtil::budget::sub_expired() )
+					throw std::runtime_error( "time budget exceeded (bounded refinement)" );
+			}
+		}
+
+		// Local patch: the backward path enumeration can also recurse far
+		// faster than the wall clock polls — deep fork chains overflow the
+		// stack before the budget fires (observed: ~16k nested
+		// rtrace_primitive frames on a certain anime game 7.1.0 ending in SIGSEGV).
+		// Cap the nesting depth; the empty reference is the failure
+		// convention the caller already handles (see the trace() null check
+		// below).
+		//
+		static thread_local int64_t recursion_depth = 0;
+		struct depth_guard_t
+		{
+			int64_t& d;
+			~depth_guard_t() { d--; }
+		} _depth_guard{ ++recursion_depth };
+		if ( recursion_depth > 8192 )
+			return {};
+
 		// Save whether this is the call whose result will reach the user.
 		//
 		bool initial_call = path_map.empty();
@@ -291,6 +344,13 @@ namespace vtil
 		// Trace through the current block first.
 		//
 		auto result = tracer->trace( lookup );
+
+		// Local patch: trace can fail (null reference) on adversarial IR;
+		// the unchecked dereference below then crashes. Propagate the
+		// failure — callers of rtrace already handle empty results.
+		//
+		if ( !result )
+			return {};
 
 		// If result has any variables:
 		//
@@ -449,6 +509,21 @@ namespace vtil
 		// If invalid/.begin() iterator or register with "no-trace" flags, return as is.
 		//
 		if ( lookup.at.is_begin() || ( lookup.is_register() && ( lookup.reg().flags & ( register_volatile | register_readonly ) ) ) )
+			return lookup.to_expression();
+
+		// Local patch: trace <-> rtrace_primitive/propagate recursion has no
+		// depth bound; adversarial dual-shell graphs (a certain anime game 4.3-4.7) spin
+		// for hours without resolving. Cap the nesting depth and return the
+		// variable as-is (the same "unknown symbolic state" result the
+		// unknown-access path below returns) so the caller unwinds.
+		//
+		static thread_local int64_t recursion_depth = 0;
+		struct depth_guard_t
+		{
+			int64_t& d;
+			~depth_guard_t() { d--; }
+		} _depth_guard{ ++recursion_depth };
+		if ( recursion_depth > 512 )
 			return lookup.to_expression();
 
 		// Fast forward until iterator writes to the lookup, if none found return as is.

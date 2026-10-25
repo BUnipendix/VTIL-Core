@@ -42,8 +42,13 @@ namespace vtil
 		{
 			// Until we reach the destination:
 			//
+			// Local patch: is_valid() is `!is_end() || !is_begin()`, which is
+			// true for end iterators of non-empty blocks — the walk then
+			// dereferences the null entry (upstream crash on adversarial IR).
+			// Stop at end iterators explicitly.
+			//
 			const std::vector<basic_block*>* links = nullptr;
-			while ( it != dst && it.is_valid() )
+			while ( it != dst && !it.is_end() )
 			{
 				// If we reached the beginning of the block, set links and break.
 				// - Backward.

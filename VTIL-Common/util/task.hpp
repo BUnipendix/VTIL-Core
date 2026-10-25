@@ -156,16 +156,35 @@ namespace vtil::task
 		instance& operator=( instance&& ) = default;
 		instance& operator=( const instance& ) = default;
 
-		// Destruction calls ::get if pooling is enabled to 
-		// propagate exceptions from std::future.
+		// Local patch: upstream's destructor called handle.get() directly,
+		// which rethrows the task's exception from inside a noexcept
+		// destructor — any exception escaping a pooled task (e.g. the
+		// wall-clock budget guards firing inside an optimizer pass)
+		// terminated the process instead of propagating. join() consumes
+		// the handle and propagates; the destructor only joins silently.
 		//
-		~instance()
+		bool joined = false;
+
+		void join()
 		{
+			if ( joined )
+				return;
+			joined = true;
 #if VTIL_USE_THREAD_POOLING
 			handle.get();
 #else
 			handle.join();
 #endif
+		}
+
+		// Destruction joins if pooling is enabled, swallowing exceptions so
+		// the noexcept destructor can never terminate. Callers that want the
+		// task's exception must call join() themselves (see
+		// transform_parallel).
+		//
+		~instance()
+		{
+			try { join(); } catch ( ... ) {}
 		}
 	};
 };

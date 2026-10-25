@@ -28,6 +28,8 @@
 #pragma once
 #include <iterator>
 #include <vector>
+#include <cstdlib>
+#include <exception>
 #include "task.hpp"
 #include "type_helpers.hpp"
 #include "intrinsics.hpp"
@@ -41,6 +43,22 @@
 
 namespace vtil
 {
+	// Local patch: the parallel task pool makes the optimizer nondeterministic
+	// (thread-local simplifier caches + scheduling order change fold results
+	// run to run; observed on adversarial IR where an entry flipped between
+	// ok and invalid-vjmp across identical invocations). VTIL_SERIAL_OPT=1
+	// forces the serial path so regressions are comparable.
+	//
+	inline bool serial_transform_override()
+	{
+		static const bool enabled = []
+		{
+			const char* e = getenv( "VTIL_SERIAL_OPT" );
+			return e && *e && *e != '0';
+		}();
+		return enabled;
+	}
+
 	namespace impl
 	{
 		template<typename T>
@@ -63,10 +81,15 @@ namespace vtil
 		// If parallel transformation is disabled or if the container only has one entry, 
 		// fallback to serial transformation.
 		//
-		if ( !VTIL_USE_PARALLEL_TRANSFORM || container_size == 1 )
+		if ( !VTIL_USE_PARALLEL_TRANSFORM || serial_transform_override() || container_size == 1 )
 		{
+			// Local patch: the upstream serial fallback did `return worker(*it)`
+			// inside the loop, so it only ever transformed the FIRST element —
+			// harmless while the branch was only reachable for single-element
+			// containers, but wrong now that the serial override is reachable.
 			for ( auto it = std::begin( container ); it != std::end( container ); ++it )
-				return worker( *it );
+				worker( *it );
+			return;
 		}
 		// Otherwise, create task pool and insert for each entry.
 		//
@@ -76,6 +99,27 @@ namespace vtil
 			tasks.reserve( container_size );
 			for ( auto it = std::begin( container ); it != std::end( container ); ++it )
 				tasks.emplace_back( [ &worker, value = impl::ref_adjust( *it ) ] () {  worker( value );  } );
+
+			// Local patch: join every task explicitly so a task's exception
+			// propagates out of this function instead of out of a noexcept
+			// destructor (see task.hpp); rethrow the first failure only after
+			// all tasks joined.
+			//
+			std::exception_ptr first_failure;
+			for ( auto& task : tasks )
+			{
+				try
+				{
+					task.join();
+				}
+				catch ( ... )
+				{
+					if ( !first_failure )
+						first_failure = std::current_exception();
+				}
+			}
+			if ( first_failure )
+				std::rethrow_exception( first_failure );
 		}
 	}
 };

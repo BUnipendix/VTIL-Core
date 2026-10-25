@@ -32,6 +32,11 @@
 #include "../directives/transformer.hpp"
 #include <vtil/io>
 #include <vtil/utility>
+// Local patch: scoped sub-deadline for bounded symbolic refinements.
+#include "../../VTIL-Common/util/rtrace-budget.hpp"
+#include <chrono>
+#include <cstdlib>
+#include <stdexcept>
 
 // [Configuration]
 // Determine the depth limit after which we start self generated signature matching and
@@ -589,11 +594,112 @@ namespace vtil::symbolic
 		return true;
 	}
 
+	// Local patch: rewrite-churn accounting. The join-descriptor recursion
+	// below can loop without a scope entry, so the max-depth limiter cannot
+	// bound the work a single outermost simplify call performs. Count the
+	// simplify_expression_i invocations per outermost entry and abort with a
+	// distinct exception once NOVMP_SIMPLIFY_CHURN_LIMIT is exceeded; the
+	// public wrapper catches it and degrades to "no simplification" instead
+	// of failing the whole routine. Skipping simplification only loses
+	// optimization — it is semantics-preserving by construction.
+	//
+	namespace
+	{
+		struct simplify_churn_exception : std::exception
+		{
+			const char* what() const throw()
+			{
+				return "simplify rewrite churn limit reached";
+			}
+		};
+
+		struct simplify_churn_state_t
+		{
+			uint64_t depth = 0;             // nesting of simplify_expression_i entries
+			uint64_t entry_invocations = 0; // invocations within the outermost entry
+			uint64_t total = 0;             // per-routine total (one routine per worker process)
+			uint64_t limit_hits = 0;        // how many entries were churn-aborted
+			uint64_t max_entry = 0;         // largest outermost-entry invocation count seen
+			int64_t limit = -1;             // NOVMP_SIMPLIFY_CHURN_LIMIT, resolved lazily; <=0 disables
+		};
+		static thread_local simplify_churn_state_t churn_state;
+
+		struct simplify_churn_sentinel
+		{
+			bool outermost;
+			simplify_churn_sentinel() : outermost( churn_state.depth++ == 0 )
+			{
+				if ( outermost )
+					churn_state.entry_invocations = 0;
+			}
+			~simplify_churn_sentinel()
+			{
+				if ( outermost && churn_state.entry_invocations > churn_state.max_entry )
+					churn_state.max_entry = churn_state.entry_invocations;
+				churn_state.depth--;
+			}
+		};
+	}
+
 	// Attempts to simplify the expression given, returns whether the simplification
 	// succeeded or not.
 	//
 	static bool simplify_expression_i( expression::reference& exp, bool pretty, bool unpack )
 	{
+		// Local patch: simplify_expression_i <-> transform/translate recurse
+		// into each other through join descriptors without a scope entry, so
+		// the max-depth limiter below never sees the cycle; adversarial shell
+		// code (a certain anime game 4.3.0 entry 0x5e6ce) makes the rewrite churn for hours
+		// without unwinding. Poll the wall clock every 1024 invocations and
+		// fail fast with the same "time budget exceeded" the other guards
+		// throw. The RAII scope references on the unwind path keep the cache
+		// consistent while the exception propagates.
+		//
+		simplify_churn_sentinel churn_sentinel;
+		{
+			++churn_state.total;
+			++churn_state.entry_invocations;
+			if ( churn_state.limit < 0 )
+			{
+				churn_state.limit = 0;
+				if ( const char* e = getenv( "NOVMP_SIMPLIFY_CHURN_LIMIT" ) )
+					churn_state.limit = atoll( e );
+			}
+			if ( churn_state.limit > 0 && churn_state.entry_invocations > ( uint64_t ) churn_state.limit )
+			{
+				++churn_state.limit_hits;
+				throw simplify_churn_exception{};
+			}
+
+			static thread_local uint64_t invoke_count = 0;
+			static thread_local std::chrono::steady_clock::time_point deadline{};
+			static thread_local bool deadline_set = false;
+			if ( ++invoke_count % 1024 == 0 )
+			{
+				if ( !deadline_set )
+				{
+					int64_t lim = 0;
+					if ( const char* e = getenv( "NOVMP_TIME_LIMIT" ) )
+						lim = atoll( e );
+					deadline_set = true;
+					deadline = lim > 0
+						? std::chrono::steady_clock::now() + std::chrono::seconds( lim )
+						: std::chrono::steady_clock::time_point::max();
+				}
+				if ( std::chrono::steady_clock::now() > deadline )
+				{
+					char msg[ 128 ];
+					snprintf( msg, sizeof( msg ), "time budget exceeded (simplify; %llu invocations, %llu churn aborts, max entry %llu)",
+					          ( unsigned long long ) churn_state.total, ( unsigned long long ) churn_state.limit_hits,
+					          ( unsigned long long ) churn_state.max_entry );
+					throw std::runtime_error( msg );
+				}
+				// Local patch: honor the scoped refinement sub-deadline too.
+				if ( vtil::budget::sub_expired() )
+					throw std::runtime_error( "time budget exceeded (bounded refinement)" );
+			}
+		}
+
 		auto& lstate = *local_state;
 		using namespace logger;
 
@@ -980,6 +1086,18 @@ namespace vtil::symbolic
 	//
 	bool simplify_expression( expression::reference& exp, bool pretty, bool unpack )
 	{
-		return simplify_expression_i( exp, pretty, unpack );
+		// Local patch: a churn-abort unwound through RAII states, so the cache
+		// stays consistent and the expression reference still points at the
+		// last complete rewrite step. Report the entry as unsimplified and
+		// let the caller proceed with the partially-simplified form.
+		//
+		try
+		{
+			return simplify_expression_i( exp, pretty, unpack );
+		}
+		catch ( simplify_churn_exception& )
+		{
+			return false;
+		}
 	}
 };
