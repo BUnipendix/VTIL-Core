@@ -13,6 +13,12 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/aquynh/capstone
     GIT_TAG        d71c95b09b1fa478c0ab9294b07fd6f2efaa1b31
     GIT_SHALLOW    false
+    # Local patch: the pinned revision selects the OLD behavior of CMP0048,
+    # which CMake 4.x no longer supports — rewrite it to NEW in the fetched
+    # tree (see cmake4_compat.cmake).
+    PATCH_COMMAND  ${CMAKE_COMMAND}
+                   -DCAPSTONE_DIR=<SOURCE_DIR>
+                   -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake4_compat.cmake
 )
 FetchContent_MakeAvailable(capstone)
 
