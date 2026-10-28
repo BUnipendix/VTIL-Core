@@ -53,17 +53,37 @@ namespace vtil
 		return desc;
 	}
 
+	// Local patch: raised when an expression width cannot be represented as
+	// a VTIL operand. Instruction operands must be byte-aligned (1-bit flag
+	// registers excepted), while symbolic expressions carry arbitrary bit
+	// widths; the guards below convert that mismatch from a silent
+	// default-constructed operand (surfacing far away as an assert) into an
+	// exception the translation caller can catch to skip the rewrite.
+	//
+	struct batch_translation_failed : std::exception
+	{
+		const char* what() const throw() { return "batch translation failed"; }
+	};
+
 	// Translates the given symbolic expression into instruction equivalents, 
 	// if provided invokes the proxy for each subtranslation it needs to do.
 	//
 	template<typename T>
 	static operand translate_expression( const symbolic::expression::reference& exp, basic_block* block, const T& proxy, const il_const_iterator& it_sp = symbolic::free_form_iterator )
 	{
+		// Local patch: guarded temporary allocation — see the comment above.
+		//
+		const auto make_tmp = [ & ] ( bitcnt_t bits ) -> operand
+		{
+			if ( bits != 1 && ( bits & 7 ) )
+				throw batch_translation_failed{};
+			return block->tmp( bits );
+		};
 		// Declare a helper to force an operand into register form.
 		//
 		const auto force_clobber_register = [ & ] ( operand& op )
 		{
-			operand tmp = block->tmp( op.bit_count() );
+			operand tmp = make_tmp( op.bit_count() );
 			block->mov( tmp, op );
 			op = tmp;
 		};
@@ -104,7 +124,7 @@ namespace vtil
 					//
 					if( auto displacement = ( var.mem().base - symbolic::CTX( it_sp )[ REG_SP ] ) )
 					{
-						operand tmp = block->tmp( exp->size() );
+						operand tmp = make_tmp( exp->size() );
 						block->ldd( tmp, REG_SP, *displacement );
 						return tmp;
 					}
@@ -136,12 +156,12 @@ namespace vtil
 						operand base = cvt( mem_base );
 						if ( base.is_immediate() )
 						{
-							operand tmp2 = block->tmp( 64 );
+							operand tmp2 = make_tmp( 64 );
 							block->mov( tmp2, base );
 							base = tmp2;
 						}
 
-						operand tmp = block->tmp( exp->size() );
+						operand tmp = make_tmp( exp->size() );
 						block->ldd( tmp, base, make_imm( offset ) );
 						return tmp;
 					}
@@ -158,7 +178,7 @@ namespace vtil
 
 					// If stack pointer, remove the current offset:
 					//
-					operand tmp = block->tmp( reg.bit_count );
+					operand tmp = make_tmp( reg.bit_count );
 					if ( reg.is_stack_pointer() && block->sp_offset != 0 )
 					{
 						block->mov( tmp, reg )
@@ -176,7 +196,7 @@ namespace vtil
 			{
 				// Emit move into temporary (which is zero-extending by default) and return.
 				//
-				operand tmp = block->tmp( *exp->rhs->get<bitcnt_t>() );
+				operand tmp = make_tmp( *exp->rhs->get<bitcnt_t>() );
 				block->mov( tmp, cvt( *exp->lhs ) );
 				return tmp;
 			}
@@ -184,7 +204,7 @@ namespace vtil
 			{
 				// Emit move into temporary by sign-extension.
 				//
-				operand tmp = block->tmp( *exp->rhs->get<bitcnt_t>() );
+				operand tmp = make_tmp( *exp->rhs->get<bitcnt_t>() );
 				block->movsx( tmp, cvt( *exp->lhs ) );
 				return tmp;
 			}
@@ -281,7 +301,7 @@ namespace vtil
 
 					// Allocate temporary.
 					//
-					operand tmp = block->tmp( exp->rhs->size() );
+					operand tmp = make_tmp( exp->rhs->size() );
 
 					// Push [<INS> Tmp Lhs Rhs] and return Tmp.
 					//
@@ -346,7 +366,7 @@ namespace vtil
 			{
 				// Allocate boolean temporary.
 				//
-				operand tmp = block->tmp( 1 );
+				operand tmp = make_tmp( 1 );
 
 				// Translate the both sides.
 				//

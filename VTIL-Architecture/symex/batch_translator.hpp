@@ -41,11 +41,11 @@ namespace vtil
 
 		// The expression cache.
 		//
-		std::unordered_map<symbolic::expression::reference, operand, 
-			               symbolic::expression::reference::hasher, 
+		std::unordered_map<symbolic::expression::reference, operand,
+			               symbolic::expression::reference::hasher,
 			               symbolic::expression::reference::if_identical> translation_cache;
-		
-		// Constructed by binding to a block and optionally a reference to 
+
+		// Constructed by binding to a block and optionally a reference to
 		// the point REG_SP will be calculated from.
 		//
 		batch_translator( basic_block* block, il_const_iterator it_sp = symbolic::free_form_iterator ) : block( block ), it_sp( std::move( it_sp ) ) {}
@@ -57,7 +57,7 @@ namespace vtil
 			// If integer, return as is.
 			//
 			if ( exp->is_constant() ) return { *exp->get(), exp->size() };
-			
+
 			operand& op = translation_cache[ exp ];
 			if ( !op.is_valid() )
 			{
@@ -67,6 +67,11 @@ namespace vtil
 					[ & ] ( auto& exp, auto* block ) { return *this << exp; },
 					it_sp
 				);
+				// Local patch: signal the failure instead of letting the
+				// default-constructed operand be emitted into the stream.
+				//
+				if ( !op.is_valid() )
+					throw batch_translation_failed{};
 			}
 			fassert( exp.size() == op.bit_count() );
 			return op;

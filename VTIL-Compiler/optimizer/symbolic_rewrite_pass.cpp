@@ -71,6 +71,17 @@ namespace vtil::optimizer
 		basic_block temporary_block = { blk->owner, blk->entry_vip };
 		temporary_block.last_temporary_index = blk->last_temporary_index;
 
+		// Local patch: set when any batch translation produced a
+		// default-constructed operand (see translate_checked below).
+		//
+		bool translation_failed = false;
+
+		// Local patch: an untranslatable expression raises
+		// batch_translation_failed from deep inside the recursion; discard the
+		// whole rewrite (block unchanged) instead of emitting it.
+		//
+		try
+		{
 		for ( il_const_iterator it = blk->begin(); !it.is_end(); )
 		{
 			// Execute starting from the instruction.
@@ -81,6 +92,23 @@ namespace vtil::optimizer
 			//
 			std::vector<instruction> instruction_buffer;
 			batch_translator translator = { &temporary_block };
+
+			// Local patch: an expression the batch translator cannot represent
+			// (an operator translate_expression does not handle, or a variable
+			// that is neither memory nor register) falls through an
+			// unreachable() that compiles to nothing in release builds, and
+			// the default-constructed operand then lands in the emitted
+			// stream — surfacing far away as an instruction-validity assert.
+			// Track validity of every translation and abandon the whole
+			// rewrite (return 0, block unchanged) if any of them failed.
+			//
+			const auto translate_checked = [ & ] ( const symbolic::expression::reference& e ) -> operand
+			{
+				operand op = translator << e;
+				if ( !op.is_valid() )
+					translation_failed = true;
+				return op;
+			};
 
 			// For each register state:
 			//
@@ -148,7 +176,7 @@ namespace vtil::optimizer
 						register_desc ks = k;
 						ks.bit_offset += i;
 						ks.bit_count = 1;
-						instruction_buffer.emplace_back( &ins::mov, ks, translator << sv );
+						instruction_buffer.emplace_back( &ins::mov, ks, translate_checked( sv ) );
 					}
 					continue;
 				}
@@ -163,7 +191,7 @@ namespace vtil::optimizer
 
 				// Buffer a mov instruction.
 				//
-				instruction_buffer.emplace_back( &ins::mov, k, translator << v );
+				instruction_buffer.emplace_back( &ins::mov, k, translate_checked( v ) );
 			}
 
 			// For each memory state:
@@ -209,7 +237,7 @@ namespace vtil::optimizer
 					//
 					instruction_buffer.emplace_back(
 						&ins::str,
-						REG_SP, make_imm<int64_t>( *displacement ), translator << v
+						REG_SP, make_imm<int64_t>( *displacement ), translate_checked( v )
 					);
 				}
 				else
@@ -237,7 +265,7 @@ namespace vtil::optimizer
 
 					// Translate the base address.
 					//
-					operand base = translator << exp;
+					operand base = translate_checked( exp );
 					if ( base.is_immediate() )
 					{
 						operand tmp = temporary_block.tmp( base.bit_count() );
@@ -249,7 +277,7 @@ namespace vtil::optimizer
 					//
 					instruction_buffer.emplace_back(
 						&ins::str,
-						base, make_imm( offset ), translator << v
+						base, make_imm( offset ), translate_checked( v )
 					);
 				}
 			}
@@ -279,11 +307,23 @@ namespace vtil::optimizer
 			//
 			vm.reset();
 		}
+		}
+		catch ( batch_translation_failed& )
+		{
+			return 0;
+		}
 
-		// Purge simplifier cache since block iterators are now invalidated 
+		// Purge simplifier cache since block iterators are now invalidated
 		// making the cache also invalid.
 		//
 		symbolic::purge_simplifier_state();
+
+		// Local patch: a translation failure means the buffered stream would
+		// carry a default-constructed operand; discard the rewrite entirely
+		// and leave the original block untouched.
+		//
+		if ( translation_failed )
+			return 0;
 
 		// Skip rewriting if we produced larger code.
 		//
