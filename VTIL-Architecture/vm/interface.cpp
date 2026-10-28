@@ -47,7 +47,21 @@ namespace vtil
 			int64_t& d;
 			~depth_guard_t() { d--; }
 		} _depth_guard{ ++recursion_depth };
-		if ( recursion_depth > 128 )
+		// Local patch: the cap is configurable (NOVMP_VM_DEPTH). The default
+		// 512 covers the deeper legitimate re-entry chains observed on
+		// single-shell era targets (128 capped real entries there) while the
+		// wall-clock budget above the lifter still bounds the adversarial
+		// dual-shell graphs that motivated the original cap.
+		//
+		static const int64_t depth_cap = []
+		{
+			int64_t v = 512;
+			if ( const char* e = getenv( "NOVMP_VM_DEPTH" ) )
+				if ( int64_t p = atoll( e ); p > 0 )
+					v = p;
+			return v;
+		}();
+		if ( recursion_depth > depth_cap )
 			throw std::runtime_error( "vm-interface nesting depth exceeded" );
 
 		// Declare a helper to convert operands of current instruction into expressions.
